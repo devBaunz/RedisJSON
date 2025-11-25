@@ -22,7 +22,7 @@ use redis_module::{NextArg, RedisError, RedisResult, RedisString, REDIS_OK};
 use std::cmp::Ordering;
 use std::str::FromStr;
 
-use json_path::{calc_once_with_paths, compile, json_path::UserPathTracker};
+use json_path::{calc_once, calc_once_with_paths, compile, json_path::UserPathTracker};
 
 use serde_json::{Number, Value};
 
@@ -1031,6 +1031,122 @@ pub fn json_mget_command_impl<M: Manager>(
         Ok(results?.into())
     })
 }
+
+///
+/// JSON.FILTER <key> [key ...] <path> <filter-expression>
+///
+#[macro_export]
+macro_rules! json_filter_command {
+    ($item:item) => {
+        #[::redis_module_macros::command(
+            {
+                name: "json.filter",
+                flags: [ReadOnly],
+                acl_categories: [Read, Single("json")],
+                arity: -4,
+                complexity "O(M*N) where M is the number of keys and N is the size of the document. Both filter-expression and path are evaluated against each document, with filter evaluation occurring first. When filter or path evaluate to multiple values: O(N1+N2+...+Nm) where m is the number of keys and Ni is the size of the i-th key",
+                since: "2.8.16",
+                summary: "Return the values at path from multiple key arguments if they match filter expression",
+                key_spec: [
+                    {
+                        notes: "The key containing the JSON document",
+                        flags: [ReadOnly],
+                        begin_search: Index({ index: 1 }),
+                        find_keys: Range({ last_key: 0, steps: 1, limit: 0 }),
+                    }
+                ],
+                args: [
+                    {
+                        name: "key",
+                        arg_type: Key,
+                        key_spec_index: 0,
+                        flags: [Multiple],
+                    },
+                    {
+                        name: "path",
+                        arg_type: String,
+                    },
+                    {
+                        name: "filter_expr",
+                        arg_type: String,
+                    }
+                ]
+            }
+        )]
+        $item
+    };
+}
+
+pub fn json_filter_command_impl<M: Manager>(
+    manager: M,
+    ctx: &Context,
+    args: Vec<RedisString>
+) -> RedisResult {
+    if args.len() < 4 {
+        return Err(RedisError::WrongArity);
+    }
+
+    // Last argument is the filter-expression
+    let filter_expr = args.last().ok_or(RedisError::WrongArity)?;
+    let filter_path = filter_expr.try_as_str()?;
+
+    // Second-to-last argument is the path
+    let path_arg = args.get(args.len() - 2).ok_or(RedisError::WrongArity)?;
+    let path = Path::new(path_arg.try_as_str()?);
+
+    // All arguments between position 1 and len-2 are keys
+    let keys = &args[1..args.len() - 2];
+
+    let format_options = ReplyFormatOptions::new(is_resp3(ctx), ReplyFormat::STRING);
+
+    // Verify that at least one key exists
+    if keys.is_empty() {
+        return Err(RedisError::WrongArity);
+    }
+
+    // Validate filter syntax by compiling once upfront
+    if let Err(e) = compile(filter_path) {
+        return Err(RedisError::String(e.to_string()));
+    }
+
+    let results: Result<Vec<RedisValue>, RedisError> = keys
+        .iter()
+        .map(|key| {
+            manager
+                .open_key_read(ctx, key)
+                .map_or(Ok(RedisValue::Null), |json_key| {
+                    json_key.get_value().map_or(Ok(RedisValue::Null), |value| {
+                        value.map_or(Ok(RedisValue::Null), |doc| {
+                            // Compile and evaluate the filter expression against the document
+                            let filter_query = match compile(filter_path) {
+                                Ok(q) => q,
+                                Err(e) => return Err(RedisError::String(e.to_string())),
+                            };
+                            let filter_results = calc_once(filter_query, doc);
+
+                            // If filter returns non-empty results, the document passes
+                            if !filter_results.is_empty() {
+                                // Fetch the path from this document
+                                let key_value = KeyValue::new(doc);
+                                let res = if !path.is_legacy() {
+                                    key_value.to_string_multi(path.get_path(), &format_options)
+                                } else {
+                                    key_value.to_string_single(path.get_path(), &format_options)
+                                };
+                                Ok(res.map_or(RedisValue::Null, |v| v.into()))
+                            } else {
+                                // Filter didn't match, return null
+                                Ok(RedisValue::Null)
+                            }
+                        })
+                    })
+                })
+        })
+        .collect();
+
+    Ok(results?.into())
+}
+
 ///
 /// JSON.TYPE <key> [path]
 ///
